@@ -113,6 +113,8 @@ public class StorageHelper {
             }
         } catch (IOException e) {
             throw new IllegalStateException(e);
+        } finally {
+            stateNow.storage.readArena.close();
         }
     }
 
@@ -132,5 +134,17 @@ public class StorageHelper {
         }
         ssTablesEntryQuantity = countEntry;
         return compactionTableByteSize + countEntry * 4L * Long.BYTES + Long.BYTES;
+    }
+
+    public static long sizeOf(final Entry<MemorySegment> entry) {
+        if (entry == null) {
+            return 0L;
+        }
+
+        if (entry.value() == null) {
+            return entry.key().byteSize();
+        }
+
+        return entry.key().byteSize() + entry.value().byteSize();
     }
 }

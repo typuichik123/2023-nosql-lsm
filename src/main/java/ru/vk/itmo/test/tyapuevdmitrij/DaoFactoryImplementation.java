@@ -14,11 +14,6 @@ import java.nio.charset.StandardCharsets;
 public class DaoFactoryImplementation implements DaoFactory.Factory<MemorySegment, Entry<MemorySegment>> {
 
     @Override
-    public Dao<MemorySegment, Entry<MemorySegment>> createDao() {
-        return new MemorySegmentDao();
-    }
-
-    @Override
     public Dao<MemorySegment, Entry<MemorySegment>> createDao(Config config) {
         return new MemorySegmentDao(config);
     }

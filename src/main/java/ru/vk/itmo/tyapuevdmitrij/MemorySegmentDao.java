@@ -5,7 +5,6 @@ import ru.vk.itmo.Dao;
 import ru.vk.itmo.Entry;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -17,32 +16,35 @@ import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.Lock;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>> {
     private final Path ssTablePath;
     private final Config config;
     private State state;
-    private final Lock storageLock = new ReentrantLock();
-    private final ExecutorService executor =
-            Executors.newSingleThreadExecutor(task -> new Thread(task, "DaoMemorySegment"));
+    private final ExecutorService flusher =
+            Executors.newSingleThreadExecutor(r -> {
+                final Thread result = new Thread(r);
+                result.setName("flusher");
+                return result;
+            });
+    private final ExecutorService compactor =
+            Executors.newSingleThreadExecutor(r -> {
+                final Thread result = new Thread(r);
+                result.setName("compactor");
+                return result;
+            });
     private final ReadWriteLock upsertLock = new ReentrantReadWriteLock();
-    private final AtomicBoolean autoFlushing = new AtomicBoolean();
-
-    public MemorySegmentDao() {
-        ssTablePath = null;
-        config = null;
-    }
+    AtomicBoolean closed = new AtomicBoolean();
 
     public MemorySegmentDao(Config config) {
         ssTablePath = config.basePath();
         state = new State(new ConcurrentSkipListMap<>(MemorySegmentComparator.getMemorySegmentComparator()),
-                null,
+                null, new AtomicLong(),
                 new Storage(ssTablePath));
         this.config = config;
     }
@@ -117,115 +119,116 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
 
     @Override
     public void upsert(Entry<MemorySegment> entry) {
-        long entrySize = entry.key().byteSize();
-        entrySize += entry.value() == null ? 0 : entry.value().byteSize();
-        if (state.memoryUsage.addAndGet(entrySize) > config.flushThresholdBytes()) {
-            if (autoFlushing.get() && state.flushMemTable != null) {
-                throw new FilesException("dont upsert - overload");
-            }
-            if (!autoFlushing.getAndSet(true)) {
-                flush();
-            }
-        }
+        final boolean autoFlush;
         upsertLock.readLock().lock();
         try {
-            this.state.memTable.put(entry.key(), entry);
+            if (state.memoryUsage.get() > config.flushThresholdBytes()
+                    && state.flushMemTable != null) {
+                throw new IllegalStateException("Can't keep up with flushing!");
+            }
+
+            // Upsert
+            final Entry<MemorySegment> previous = state.memTable.put(entry.key(), entry);
+
+            // Update size estimate
+            final long size = state.memoryUsage.addAndGet(StorageHelper.sizeOf(entry) - StorageHelper.sizeOf(previous));
+            autoFlush = size > config.flushThresholdBytes();
         } finally {
             upsertLock.readLock().unlock();
+        }
+
+        if (autoFlush) {
+            flushing(true);
         }
     }
 
     @Override
-    public void flush() {
-        if (state.memTable.isEmpty() || state.flushMemTable != null) {
-            return;
-        }
-        flushing();
+    public void flush() throws IOException {
+        flushing(false);
     }
 
-    public void flushing() {
-        storageLock.lock();
-        try {
+    public void flushing(final boolean auto) {
+        flusher.submit(() -> {
+            final State currentState;
             upsertLock.writeLock().lock();
             try {
-                state = new State(new ConcurrentSkipListMap<>(MemorySegmentComparator.getMemorySegmentComparator()),
-                        state.memTable,
-                        state.storage);
+                if (this.state.memTable.isEmpty()) {
+                    // Nothing to flush
+                    return;
+                }
+
+                if (auto && this.state.memoryUsage.get() < config.flushThresholdBytes()) {
+                    // Not enough data to flush
+                    return;
+                }
+
+                // Switch memTable to flushing
+                currentState = this.state.prepareToFlash();
+                this.state = currentState;
             } finally {
                 upsertLock.writeLock().unlock();
             }
-            if (this.state.flushMemTable.isEmpty()) {
+            int ssTablesQuantity = state.storage.ssTablesQuantity;
+            // Write
+            try {
+                state.storage.save(state.flushMemTable.values(), ssTablePath, state.storage);
+            } catch (IOException e) {
+                Runtime.getRuntime().halt(-1);
                 return;
             }
-            state.storage.save(state.flushMemTable.values(), ssTablePath, state.storage);
-            Storage loadFlushed = new Storage(ssTablePath);
+
+            // Open
+            final MemorySegment flushed;
+            Path flushedPath = ssTablePath.resolve(StorageHelper.SS_TABLE_FILE_NAME + ssTablesQuantity);
+            flushed = NmapBuffer.getReadBufferFromSsTable(flushedPath, state.storage.readArena);
+
+            // Switch
             upsertLock.writeLock().lock();
             try {
-                state = new State(state.memTable,
-                        null,
-                        loadFlushed);
+                this.state = this.state.afterFLush(flushed);
             } finally {
                 upsertLock.writeLock().unlock();
             }
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        } finally {
-            autoFlushing.set(false);
-            storageLock.unlock();
-        }
+        }).state();
     }
 
     @Override
     public void compact() throws IOException {
         State currentState = this.state;
-        if (currentState.storage.ssTablesQuantity <= 1 && currentState.memTable.isEmpty()) {
+        if (currentState.storage.ssTablesQuantity <= 1) {
             return;
         }
-        storageLock.lock();
-        try {
-            executor.execute(() -> {
-                State stateNow = this.state;
-                storageLock.lock();
-                try {
-                    if (!currentState.storage.readArena.scope().isAlive()) {
-                        return;
-                    }
-                    stateNow.storage.storageHelper.saveDataForCompaction(stateNow, ssTablePath);
-                    stateNow.storage.storageHelper.deleteOldSsTables(ssTablePath);
-                    stateNow.storage.storageHelper.renameCompactedSsTable(ssTablePath);
-                    Storage load = new Storage(ssTablePath);
-                    upsertLock.writeLock().lock();
-                    try {
-                        this.state = new State(this.state.memTable, this.state.flushMemTable, load);
-                    } finally {
-                        upsertLock.writeLock().unlock();
-                    }
-                } finally {
-                    storageLock.unlock();
-                }
-            });
-        } finally {
-            storageLock.unlock();
+        Future<?> submit = compactor.submit(() -> {
+            State stateNow = this.state;
+            if (!currentState.storage.readArena.scope().isAlive()) {
+                return;
+            }
+            stateNow.storage.storageHelper.saveDataForCompaction(stateNow, ssTablePath);
+            stateNow.storage.storageHelper.deleteOldSsTables(ssTablePath);
+            stateNow.storage.storageHelper.renameCompactedSsTable(ssTablePath);
+            Storage load = new Storage(ssTablePath);
+            upsertLock.writeLock().lock();
+            try {
+                this.state = new State(this.state.memTable, this.state.flushMemTable, state.memoryUsage, load);
+            } finally {
+                upsertLock.writeLock().unlock();
+            }
+        });
+        if (submit.isCancelled()) {
+            throw new FilesException("compact error");
         }
-
     }
 
     @Override
     public synchronized void close() throws IOException {
-        if (state.storage == null) {
+        if (closed.getAndSet(true)) {
             return;
         }
         flush();
-        executor.close();
-        try {
-            boolean terminated;
-            do {
-                terminated = executor.awaitTermination(1, TimeUnit.HOURS);
-            } while (!terminated);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException(e);
-        }
+        flusher.close();
+        compactor.close();
 
+        // Close arena
+        state.storage.readArena.close();
     }
 }

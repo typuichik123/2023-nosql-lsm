@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -18,9 +19,8 @@ import java.util.NoSuchElementException;
 
 public class Storage {
     protected final StorageHelper storageHelper;
-    protected final int ssTablesQuantity;
+    protected int ssTablesQuantity;
     protected List<MemorySegment> ssTables;
-
     protected final Arena readArena;
 
     public Storage(Path ssTablePath) {
@@ -34,14 +34,17 @@ public class Storage {
         }
     }
 
-    public void save(Iterable<Entry<MemorySegment>> memTableEntries,
+    public Storage(StorageHelper storageHelper, int ssTablesQuantity, List<MemorySegment> ssTables, Arena readArena) {
+        this.storageHelper = storageHelper;
+        this.ssTablesQuantity = ssTablesQuantity;
+        this.ssTables = ssTables;
+        this.readArena = readArena;
+    }
+
+    public void save(Collection<Entry<MemorySegment>> memTableEntries,
                      Path ssTablePath,
                      Storage prevState) throws IOException {
-        if (!readArena.scope().isAlive()) {
-            return;
-        }
-        readArena.close();
-        if (!memTableEntries.iterator().hasNext()) {
+        if (memTableEntries.isEmpty()) {
             return;
         }
         Path path = ssTablePath.resolve(StorageHelper.TEMP_SS_TABLE_FILE_NAME + prevState.ssTablesQuantity);
